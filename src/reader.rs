@@ -1,6 +1,7 @@
 //! Index reader: opens and queries the search index.
 
 use crate::builder::Manifest;
+use crate::cache::{CacheResult, SegmentCache};
 use crate::hybrid::fuse_hybrid;
 use crate::lexical::{bm25_score, tokenize, LexicalIndex, PostingList};
 use crate::storage::{BlobStore, StorageError, StorageResult};
@@ -24,6 +25,8 @@ pub struct IndexReader {
     vector_index: VectorIndex,
     /// Vocabulary lookup map (term -> (term_id, entry)).
     vocab_map: HashMap<String, (u32, crate::lexical::VocabEntry)>,
+    /// Segment cache for reducing repeated reads.
+    cache: SegmentCache,
 }
 
 impl IndexReader {
@@ -51,6 +54,7 @@ impl IndexReader {
             lexical_index,
             vector_index,
             vocab_map,
+            cache: SegmentCache::new(),
         })
     }
 
@@ -59,12 +63,33 @@ impl IndexReader {
         self.manifest.doc_count
     }
 
-    /// Fetch segment data for a given pointer.
+    /// Fetch segment data for a given pointer, using cache with 2MB aligned reads.
     async fn fetch_segment(&self, ptr: &SegmentPtr) -> StorageResult<bytes::Bytes> {
-        let path = format!("{}/segments/{:04}.dat", self.prefix, ptr.segment_id);
-        self.store
-            .get_range(&path, ptr.offset..ptr.offset + ptr.length as u64)
-            .await
+        let start = ptr.offset;
+        let end = ptr.offset + ptr.length as u64;
+
+        // Check cache first
+        match self.cache.get(ptr.segment_id, start, end) {
+            CacheResult::Hit(data) => Ok(data),
+            CacheResult::Miss(missing_ranges) => {
+                // Fetch missing chunks from storage
+                let path = format!("{}/segments/{:04}.dat", self.prefix, ptr.segment_id);
+
+                for (chunk_start, chunk_end) in missing_ranges {
+                    let chunk_data = self.store.get_range(&path, chunk_start..chunk_end).await?;
+                    self.cache.put(ptr.segment_id, chunk_start, chunk_data);
+                }
+
+                // Now get from cache (should hit)
+                match self.cache.get(ptr.segment_id, start, end) {
+                    CacheResult::Hit(data) => Ok(data),
+                    CacheResult::Miss(_) => {
+                        // Fallback to direct fetch (shouldn't happen)
+                        self.store.get_range(&path, start..end).await
+                    }
+                }
+            }
+        }
     }
 
     /// Fetch and deserialize a posting list.

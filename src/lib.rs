@@ -62,6 +62,7 @@
 //! on-demand via range requests, making this ideal for object storage.
 
 pub mod builder;
+pub mod cache;
 pub mod error;
 pub mod hybrid;
 pub mod lexical;
