@@ -1,18 +1,19 @@
 //! Wikipedia indexing example.
 //!
-//! Downloads English Wikipedia articles from HuggingFace (wikimedia/wikipedia dataset)
+//! Downloads the full English Wikipedia from HuggingFace (wikimedia/wikipedia dataset)
 //! using the hf-hub crate and builds a search index.
 //! Uses random embeddings for demonstration (in production, use a real embedding model).
 //!
 //! Usage:
-//!   cargo run --release --example wikipedia -- [--count N] [--dim D]
+//!   cargo run --release --example wikipedia -- [--limit N] [--dim D]
 //!
 //! Options:
-//!   --count N   Number of documents to index (default: 10000)
+//!   --limit N   Limit number of documents to index (default: all ~6.7M articles)
 //!   --dim D     Embedding dimension (default: 128)
 //!
-//! Note: The English Wikipedia dataset is large (~450MB per parquet file).
-//! Use --release for better performance when indexing many documents.
+//! Note: The full English Wikipedia is ~16GB (41 parquet files, ~400MB each).
+//! Files are cached in ~/.cache/huggingface for reuse.
+//! Use --release for better performance.
 
 use arrow_array::StringArray;
 use bytes::Bytes;
@@ -33,12 +34,11 @@ struct WikiArticle {
     text: String,
 }
 
-/// Download and parse Wikipedia articles from HuggingFace using hf-hub.
-/// Downloads parquet files sequentially until we have enough articles.
-async fn download_wikipedia(count: usize) -> Result<Vec<WikiArticle>, Box<dyn std::error::Error>> {
+/// Download and parse all Wikipedia articles from HuggingFace using hf-hub.
+/// Downloads all parquet files for the full dataset.
+async fn download_wikipedia() -> Result<Vec<WikiArticle>, Box<dyn std::error::Error>> {
     println!("Downloading English Wikipedia from HuggingFace (wikimedia/wikipedia)...");
     println!("Using hf-hub crate for efficient caching and downloads");
-    println!("Target: {} articles", count);
     println!();
 
     // Initialize HuggingFace Hub API
@@ -57,27 +57,23 @@ async fn download_wikipedia(count: usize) -> Result<Vec<WikiArticle>, Box<dyn st
         .collect();
 
     parquet_files.sort();
+    let total_files = parquet_files.len();
     println!(
-        "Found {} parquet files for English Wikipedia",
-        parquet_files.len()
+        "Found {} parquet files for English Wikipedia (~{}GB total)",
+        total_files,
+        total_files * 400 / 1024
     );
     println!();
 
     let mut all_articles = Vec::new();
-    let mut file_index = 0;
-    let total_files = parquet_files.len();
 
-    while all_articles.len() < count && file_index < total_files {
-        let filename = &parquet_files[file_index];
-
+    for (file_index, filename) in parquet_files.iter().enumerate() {
         println!(
-            "Downloading file {}/{} (have {}/{} articles)...",
+            "Processing file {}/{}: {}",
             file_index + 1,
             total_files,
-            all_articles.len(),
-            count
+            filename
         );
-        println!("  File: {}", filename);
 
         match repo.get(filename).await {
             Ok(path) => {
@@ -88,10 +84,13 @@ async fn download_wikipedia(count: usize) -> Result<Vec<WikiArticle>, Box<dyn st
                 let bytes = Bytes::from(file_bytes);
                 println!("  Size: {} MB", bytes.len() / (1024 * 1024));
 
-                let remaining = count - all_articles.len();
-                match parse_parquet(bytes, remaining) {
+                match parse_parquet(bytes) {
                     Ok(articles) => {
-                        println!("  Parsed {} articles from this file", articles.len());
+                        println!(
+                            "  Parsed {} articles (total: {})",
+                            articles.len(),
+                            all_articles.len() + articles.len()
+                        );
                         all_articles.extend(articles);
                     }
                     Err(e) => {
@@ -103,23 +102,18 @@ async fn download_wikipedia(count: usize) -> Result<Vec<WikiArticle>, Box<dyn st
                 println!("  Warning: Failed to download: {}", e);
             }
         }
-
-        file_index += 1;
     }
 
     println!("\nTotal articles downloaded: {}", all_articles.len());
     Ok(all_articles)
 }
 
-/// Parse Wikipedia articles from parquet bytes.
-fn parse_parquet(
-    data: Bytes,
-    count: usize,
-) -> Result<Vec<WikiArticle>, Box<dyn std::error::Error>> {
+/// Parse all Wikipedia articles from parquet bytes.
+fn parse_parquet(data: Bytes) -> Result<Vec<WikiArticle>, Box<dyn std::error::Error>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(data)?;
 
     // Configure batch size for efficient reading
-    let reader = builder.with_batch_size(1024).build()?;
+    let reader = builder.with_batch_size(4096).build()?;
 
     let mut articles = Vec::new();
 
@@ -156,10 +150,6 @@ fn parse_parquet(
             (id_col, title_col, text_col, url_col)
         {
             for i in 0..batch.num_rows() {
-                if articles.len() >= count {
-                    break;
-                }
-
                 let id = ids.value(i).to_string();
                 let title = titles.value(i).to_string();
                 let text = texts.value(i).to_string();
@@ -175,10 +165,6 @@ fn parse_parquet(
                     });
                 }
             }
-        }
-
-        if articles.len() >= count {
-            break;
         }
     }
 
@@ -204,15 +190,15 @@ fn random_embedding(dim: usize) -> Vec<f32> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
-    let mut count: usize = 10000;
+    let mut limit: Option<usize> = None;
     let mut dim: usize = 128;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--count" => {
+            "--limit" => {
                 i += 1;
-                count = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(10000);
+                limit = args.get(i).and_then(|s| s.parse().ok());
             }
             "--dim" => {
                 i += 1;
@@ -225,15 +211,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Wikipedia Search Index Example");
     println!("==============================");
-    println!("Documents: {}", count);
+    if let Some(n) = limit {
+        println!("Document limit: {}", n);
+    } else {
+        println!("Document limit: none (full dataset)");
+    }
     println!("Embedding dimension: {}", dim);
     println!();
 
-    // Download articles
-    let articles = download_wikipedia(count).await?;
+    // Download all articles
+    let mut articles = download_wikipedia().await?;
 
     if articles.is_empty() {
         return Err("No articles downloaded".into());
+    }
+
+    // Apply limit if specified
+    if let Some(n) = limit {
+        if n < articles.len() {
+            println!("Limiting to {} articles (from {})", n, articles.len());
+            articles.truncate(n);
+        }
     }
 
     // Set up storage
@@ -242,15 +240,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(seglens::local(&index_dir)?);
 
     // Build the index
-    println!("\nBuilding index...");
+    println!("\nBuilding index for {} articles...", articles.len());
     let num_clusters = (articles.len() as f64).sqrt().ceil() as u32;
+    println!("Using {} clusters for IVF", num_clusters);
     let mut builder = IndexBuilder::new(dim as u32, num_clusters.max(2));
 
     let pb = ProgressBar::new(articles.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, {eta})",
             )
             .unwrap()
             .progress_chars("#>-"),
