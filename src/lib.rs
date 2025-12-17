@@ -12,11 +12,13 @@ pub mod lexical;
 pub mod object_store;
 pub mod storage;
 pub mod types;
+pub mod vector;
 
 // Re-export commonly used types
 pub use lexical::{bm25_score, tokenize, LexicalIndex, LexicalIndexBuilder, PostingList};
 pub use storage::{BlobStore, StorageError, StorageResult};
 pub use types::{DocId, Document, SearchResult, SegmentPtr, StoredDocument, TermId};
+pub use vector::{ClusterData, VectorIndex, VectorIndexBuilder};
 
 // Re-export convenience functions
 pub use object_store::local;
