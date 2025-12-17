@@ -21,12 +21,11 @@ version = "0.3"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
-reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 indicatif = "0.17"
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 arrow-array = "54"
+hf-hub = { version = "0.4", features = ["tokio"] }
 
 [[example]]
 name = "wikipedia"

@@ -1,18 +1,22 @@
 //! Wikipedia indexing example.
 //!
-//! Downloads Simple English Wikipedia articles from HuggingFace (parquet format)
-//! and builds a search index.
+//! Downloads English Wikipedia articles from HuggingFace (wikimedia/wikipedia dataset)
+//! using the hf-hub crate and builds a search index.
 //! Uses random embeddings for demonstration (in production, use a real embedding model).
 //!
 //! Usage:
-//!   cargo run --example wikipedia -- [--count N] [--dim D]
+//!   cargo run --release --example wikipedia -- [--count N] [--dim D]
 //!
 //! Options:
-//!   --count N   Number of documents to index (default: 1000)
+//!   --count N   Number of documents to index (default: 10000)
 //!   --dim D     Embedding dimension (default: 128)
+//!
+//! Note: The English Wikipedia dataset is large (~450MB per parquet file).
+//! Use --release for better performance when indexing many documents.
 
 use arrow_array::StringArray;
 use bytes::Bytes;
+use hf_hub::api::tokio::Api;
 use indicatif::{ProgressBar, ProgressStyle};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rand::Rng;
@@ -29,27 +33,82 @@ struct WikiArticle {
     text: String,
 }
 
-/// Download and parse Wikipedia articles from HuggingFace parquet file.
+/// Download and parse Wikipedia articles from HuggingFace using hf-hub.
+/// Downloads parquet files sequentially until we have enough articles.
 async fn download_wikipedia(count: usize) -> Result<Vec<WikiArticle>, Box<dyn std::error::Error>> {
-    println!("Downloading Simple English Wikipedia from HuggingFace...");
-    println!("(This may take a moment - the parquet file is ~80MB)");
+    println!("Downloading English Wikipedia from HuggingFace (wikimedia/wikipedia)...");
+    println!("Using hf-hub crate for efficient caching and downloads");
+    println!("Target: {} articles", count);
+    println!();
 
-    // Simple English Wikipedia parquet file from HuggingFace
-    let url = "https://huggingface.co/datasets/wikipedia/resolve/main/data/20220301.simple/train-00000-of-00001.parquet";
+    // Initialize HuggingFace Hub API
+    let api = Api::new()?;
+    let repo = api.dataset("wikimedia/wikipedia".to_string());
 
-    let response = reqwest::get(url).await?;
+    // Get list of parquet files from the repository
+    println!("Fetching file list from HuggingFace...");
+    let info = repo.info().await?;
 
-    if !response.status().is_success() {
-        return Err(format!("Failed to download: HTTP {}", response.status()).into());
+    let mut parquet_files: Vec<String> = info
+        .siblings
+        .iter()
+        .map(|s| s.rfilename.clone())
+        .filter(|f| f.starts_with("20231101.en/") && f.ends_with(".parquet"))
+        .collect();
+
+    parquet_files.sort();
+    println!(
+        "Found {} parquet files for English Wikipedia",
+        parquet_files.len()
+    );
+    println!();
+
+    let mut all_articles = Vec::new();
+    let mut file_index = 0;
+    let total_files = parquet_files.len();
+
+    while all_articles.len() < count && file_index < total_files {
+        let filename = &parquet_files[file_index];
+
+        println!(
+            "Downloading file {}/{} (have {}/{} articles)...",
+            file_index + 1,
+            total_files,
+            all_articles.len(),
+            count
+        );
+        println!("  File: {}", filename);
+
+        match repo.get(filename).await {
+            Ok(path) => {
+                println!("  Cached at: {}", path.display());
+
+                // Read the file
+                let file_bytes = std::fs::read(&path)?;
+                let bytes = Bytes::from(file_bytes);
+                println!("  Size: {} MB", bytes.len() / (1024 * 1024));
+
+                let remaining = count - all_articles.len();
+                match parse_parquet(bytes, remaining) {
+                    Ok(articles) => {
+                        println!("  Parsed {} articles from this file", articles.len());
+                        all_articles.extend(articles);
+                    }
+                    Err(e) => {
+                        println!("  Warning: Failed to parse parquet: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("  Warning: Failed to download: {}", e);
+            }
+        }
+
+        file_index += 1;
     }
 
-    let bytes = response.bytes().await?;
-    println!(
-        "Downloaded {} MB, parsing parquet...",
-        bytes.len() / (1024 * 1024)
-    );
-
-    parse_parquet(bytes, count)
+    println!("\nTotal articles downloaded: {}", all_articles.len());
+    Ok(all_articles)
 }
 
 /// Parse Wikipedia articles from parquet bytes.
@@ -67,7 +126,7 @@ fn parse_parquet(
     for batch_result in reader {
         let batch = batch_result?;
 
-        // Get columns by name
+        // Get columns by name - wikimedia/wikipedia schema
         let id_col = batch
             .column_by_name("id")
             .ok_or("Missing 'id' column")?
@@ -123,7 +182,6 @@ fn parse_parquet(
         }
     }
 
-    println!("Parsed {} articles from parquet", articles.len());
     Ok(articles)
 }
 
@@ -146,7 +204,7 @@ fn random_embedding(dim: usize) -> Vec<f32> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
-    let mut count: usize = 1000;
+    let mut count: usize = 10000;
     let mut dim: usize = 128;
 
     let mut i = 1;
@@ -154,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args[i].as_str() {
             "--count" => {
                 i += 1;
-                count = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1000);
+                count = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(10000);
             }
             "--dim" => {
                 i += 1;
@@ -225,7 +283,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demo queries
     println!("\n--- Lexical Search Demo ---");
-    let queries = ["history", "science", "united states", "music"];
+    let queries = [
+        "machine learning",
+        "world war",
+        "united states",
+        "quantum physics",
+    ];
 
     for query in queries {
         println!("\nSearching for: \"{}\"", query);
@@ -264,9 +327,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Hybrid search
     println!("\n--- Hybrid Search Demo ---");
-    println!("Searching for \"england\" with random embedding...");
+    println!("Searching for \"artificial intelligence\" with random embedding...");
     let results = reader
-        .search_hybrid("england", &random_embedding(dim), 3, 2)
+        .search_hybrid("artificial intelligence", &random_embedding(dim), 3, 2)
         .await?;
 
     for (i, result) in results.iter().enumerate() {
