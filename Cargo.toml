@@ -1,0 +1,21 @@
+[package]
+name = "seglens"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust library for building and querying hybrid (semantic + lexical) search indexes optimized for object storage"
+license = "MIT"
+
+[dependencies]
+object_store = "0.11"
+rkyv = { version = "0.8", features = ["bytecheck"] }
+bytes = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+async-trait = "0.1"
+
+[dependencies.futures]
+version = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
