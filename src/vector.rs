@@ -1,6 +1,7 @@
 //! Vector search components: distance functions, k-means clustering, and IVF index.
 
 use crate::types::{DocId, SegmentPtr};
+use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// Compute squared L2 (Euclidean) distance between two vectors.
@@ -69,34 +70,38 @@ pub fn kmeans(vectors: &[Vec<f32>], k: usize, max_iterations: usize) -> Vec<Vec<
     let mut centroids: Vec<Vec<f32>> = vectors.iter().take(k).cloned().collect();
 
     for _ in 0..max_iterations {
-        // Assign points to nearest centroid
-        let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); k];
-        for (i, v) in vectors.iter().enumerate() {
-            let nearest = nearest_centroid(v, &centroids);
-            clusters[nearest].push(i);
+        // Assign points to nearest centroid (parallel)
+        let assignments: Vec<usize> = vectors
+            .par_iter()
+            .map(|v| nearest_centroid(v, &centroids))
+            .collect();
+
+        // Prepare sums and counts
+        let mut counts = vec![0usize; k];
+        let mut sums = vec![vec![0.0f32; dim]; k];
+
+        for (vec_idx, &cluster_idx) in assignments.iter().enumerate() {
+            counts[cluster_idx] += 1;
+            for (j, val) in vectors[vec_idx].iter().enumerate() {
+                sums[cluster_idx][j] += val;
+            }
         }
 
         // Update centroids
-        let mut new_centroids = Vec::with_capacity(k);
-        for (cluster_idx, cluster) in clusters.iter().enumerate() {
-            if cluster.is_empty() {
-                // Keep old centroid if cluster is empty
-                new_centroids.push(centroids[cluster_idx].clone());
-            } else {
-                // Compute mean of assigned points
-                let mut mean = vec![0.0f32; dim];
-                for &point_idx in cluster {
-                    for (j, val) in vectors[point_idx].iter().enumerate() {
-                        mean[j] += val;
-                    }
+        let new_centroids: Vec<Vec<f32>> = (0..k)
+            .into_par_iter()
+            .map(|cluster_idx| {
+                if counts[cluster_idx] == 0 {
+                    centroids[cluster_idx].clone()
+                } else {
+                    let n = counts[cluster_idx] as f32;
+                    sums[cluster_idx]
+                        .iter()
+                        .map(|&v| v / n)
+                        .collect::<Vec<f32>>()
                 }
-                let n = cluster.len() as f32;
-                for val in &mut mean {
-                    *val /= n;
-                }
-                new_centroids.push(mean);
-            }
-        }
+            })
+            .collect();
 
         // Check for convergence (centroids didn't change much)
         let mut converged = true;
@@ -174,6 +179,10 @@ impl ClusterData {
 
     /// Find k nearest documents to a query vector.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(DocId, f32)> {
+        if k == 0 || self.doc_ids.is_empty() {
+            return Vec::new();
+        }
+
         let mut results: Vec<(DocId, f32)> = self
             .doc_ids
             .iter()
@@ -185,9 +194,18 @@ impl ClusterData {
             })
             .collect();
 
-        // Sort by distance (ascending)
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        results.truncate(k);
+        // Keep only the closest k using partial sorting.
+        let keep = k.min(results.len());
+        if results.len() > keep {
+            let pivot = keep.saturating_sub(1);
+            results.select_nth_unstable_by(pivot, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.truncate(keep);
+        }
+
+        // Sort the retained slice for deterministic ordering.
+        results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Convert distance to score (lower distance = higher score)
         // Use 1 / (1 + dist) for score normalization
@@ -297,6 +315,189 @@ impl VectorIndexBuilder {
         }
 
         (centroids, cluster_data)
+    }
+}
+
+// ============================================================================
+// Streaming Vector Builder (for large datasets)
+// ============================================================================
+
+use rkyv::rancor::Error as RkyvError;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
+
+/// Write buffer size per cluster (8 MB).
+const CLUSTER_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// Total in-memory budget across clusters before forcing flushes (512 MB).
+const MAX_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+
+/// Streaming vector index builder for large datasets.
+///
+/// Takes pre-trained centroids and streams documents through, buffering
+/// cluster entries and flushing to disk when memory threshold is reached.
+pub struct StreamingVectorBuilder {
+    /// Embedding dimension.
+    dim: u32,
+    /// Pre-trained centroids.
+    centroids: Vec<Vec<f32>>,
+    /// Temporary directory for cluster files.
+    temp_dir: PathBuf,
+    /// Per-cluster buffers (doc_ids, embeddings).
+    cluster_buffers: Vec<(Vec<DocId>, Vec<f32>)>,
+    /// Per-cluster buffer sizes (in bytes).
+    cluster_sizes: Vec<usize>,
+    /// Total buffered bytes across all clusters.
+    total_buffered_bytes: usize,
+    /// Number of flushes per cluster.
+    flush_counts: Vec<u32>,
+}
+
+impl StreamingVectorBuilder {
+    /// Create a new streaming builder with pre-trained centroids.
+    pub fn new(centroids: Vec<Vec<f32>>, temp_dir: PathBuf) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let num_clusters = centroids.len();
+        let dim = centroids.first().map(|c| c.len() as u32).unwrap_or(0);
+
+        Ok(Self {
+            dim,
+            centroids,
+            temp_dir,
+            cluster_buffers: vec![(Vec::new(), Vec::new()); num_clusters],
+            cluster_sizes: vec![0; num_clusters],
+            total_buffered_bytes: 0,
+            flush_counts: vec![0; num_clusters],
+        })
+    }
+
+    /// Add a document to the appropriate cluster.
+    pub fn add(&mut self, doc_id: DocId, embedding: &[f32]) -> std::io::Result<()> {
+        let cluster_idx = nearest_centroid(embedding, &self.centroids);
+
+        // Add to buffer
+        let (doc_ids, embeddings) = &mut self.cluster_buffers[cluster_idx];
+        doc_ids.push(doc_id);
+        embeddings.extend_from_slice(embedding);
+
+        // Update size estimate (4 bytes per doc_id + 4 bytes per f32)
+        let added = 4 + embedding.len() * 4;
+        self.cluster_sizes[cluster_idx] += added;
+        self.total_buffered_bytes += added;
+
+        // Flush if buffer is full or we exceed global budget.
+        if self.cluster_sizes[cluster_idx] >= CLUSTER_BUFFER_SIZE
+            || self.total_buffered_bytes >= MAX_BUFFER_BYTES
+        {
+            let target_idx = if self.total_buffered_bytes >= MAX_BUFFER_BYTES {
+                self.largest_cluster_index().unwrap_or(cluster_idx)
+            } else {
+                cluster_idx
+            };
+            self.flush_cluster(target_idx)?;
+        }
+
+        Ok(())
+    }
+
+    /// Flush a single cluster's buffer to disk.
+    fn flush_cluster(&mut self, cluster_idx: usize) -> std::io::Result<()> {
+        let (doc_ids, embeddings) = &mut self.cluster_buffers[cluster_idx];
+
+        if doc_ids.is_empty() {
+            return Ok(());
+        }
+
+        let flush_id = self.flush_counts[cluster_idx];
+        let path = self
+            .temp_dir
+            .join(format!("cluster_{:04}_{:04}.bin", cluster_idx, flush_id));
+
+        let cluster_data = ClusterData {
+            doc_ids: doc_ids.clone(),
+            embeddings: embeddings.clone(),
+            dim: self.dim,
+        };
+
+        let serialized = rkyv::to_bytes::<RkyvError>(&cluster_data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+        let mut writer = BufWriter::with_capacity(CLUSTER_BUFFER_SIZE, File::create(&path)?);
+        writer.write_all(&serialized)?;
+        writer.flush()?;
+
+        // Clear buffer and update accounting
+        let flushed = self.cluster_sizes[cluster_idx];
+        doc_ids.clear();
+        embeddings.clear();
+        self.cluster_sizes[cluster_idx] = 0;
+        self.total_buffered_bytes = self.total_buffered_bytes.saturating_sub(flushed);
+        self.flush_counts[cluster_idx] += 1;
+
+        Ok(())
+    }
+
+    /// Build the final cluster data by merging all flushed files.
+    pub fn build(mut self) -> std::io::Result<(Vec<Vec<f32>>, Vec<ClusterData>)> {
+        // Flush remaining buffers
+        for i in 0..self.centroids.len() {
+            self.flush_cluster(i)?;
+        }
+
+        // Merge cluster files
+        let mut cluster_data: Vec<ClusterData> = Vec::with_capacity(self.centroids.len());
+
+        for cluster_idx in 0..self.centroids.len() {
+            let mut merged = ClusterData::new(self.dim);
+
+            // Load all flush files for this cluster
+            for flush_id in 0..self.flush_counts[cluster_idx] {
+                let path = self
+                    .temp_dir
+                    .join(format!("cluster_{:04}_{:04}.bin", cluster_idx, flush_id));
+
+                if path.exists() {
+                    let mut file = BufReader::new(File::open(&path)?);
+                    let mut data = Vec::new();
+                    file.read_to_end(&mut data)?;
+
+                    let chunk: ClusterData = rkyv::from_bytes::<ClusterData, RkyvError>(&data)
+                        .map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+
+                    // Merge into result
+                    merged.doc_ids.extend(chunk.doc_ids);
+                    merged.embeddings.extend(chunk.embeddings);
+
+                    // Clean up
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+
+            cluster_data.push(merged);
+        }
+
+        Ok((self.centroids, cluster_data))
+    }
+
+    /// Get the number of clusters.
+    pub fn num_clusters(&self) -> usize {
+        self.centroids.len()
+    }
+
+    /// Get the embedding dimension.
+    pub fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    fn largest_cluster_index(&self) -> Option<usize> {
+        self.cluster_sizes
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, sz)| *sz)
+            .map(|(idx, _)| idx)
     }
 }
 
@@ -450,5 +651,38 @@ mod tests {
 
         let clusters = index.find_clusters(&[1.0, 1.0], 1);
         assert_eq!(clusters, vec![0]);
+    }
+
+    #[test]
+    fn test_streaming_vector_builder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Pre-compute centroids for 2 clusters
+        let centroids = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
+
+        let mut builder = StreamingVectorBuilder::new(centroids, tmp.path().to_path_buf()).unwrap();
+
+        // Add documents - should be assigned to appropriate clusters
+        builder.add(0, &[0.0, 1.0]).unwrap(); // Near cluster 0
+        builder.add(1, &[1.0, 0.0]).unwrap(); // Near cluster 0
+        builder.add(2, &[9.0, 10.0]).unwrap(); // Near cluster 1
+        builder.add(3, &[10.0, 9.0]).unwrap(); // Near cluster 1
+
+        let (centroids, cluster_data) = builder.build().unwrap();
+
+        assert_eq!(centroids.len(), 2);
+        assert_eq!(cluster_data.len(), 2);
+
+        // Total documents should be 4
+        let total_docs: usize = cluster_data.iter().map(|c| c.len()).sum();
+        assert_eq!(total_docs, 4);
+
+        // Cluster 0 should have docs 0 and 1
+        let cluster0_docs: Vec<_> = cluster_data[0].doc_ids.clone();
+        assert!(cluster0_docs.contains(&0) && cluster0_docs.contains(&1));
+
+        // Cluster 1 should have docs 2 and 3
+        let cluster1_docs: Vec<_> = cluster_data[1].doc_ids.clone();
+        assert!(cluster1_docs.contains(&2) && cluster1_docs.contains(&3));
     }
 }

@@ -61,6 +61,14 @@
 //! At startup, only the metadata files are loaded. Segment data is fetched
 //! on-demand via range requests, making this ideal for object storage.
 
+#[cfg(all(
+    feature = "jemalloc",
+    not(target_env = "musl"),
+    not(target_os = "windows")
+))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 pub mod builder;
 pub mod cache;
 pub mod error;

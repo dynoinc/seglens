@@ -120,44 +120,7 @@ impl IndexReader {
         query: &str,
         top_k: usize,
     ) -> StorageResult<Vec<SearchResult>> {
-        let tokens = tokenize(query);
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Accumulate scores for each document
-        let mut doc_scores: HashMap<DocId, f32> = HashMap::new();
-
-        // Fetch posting lists for each query term
-        for token in &tokens {
-            if let Some((_, entry)) = self.vocab_map.get(token) {
-                let posting_list = self.fetch_posting_list(&entry.posting_ptr).await?;
-
-                for posting in &posting_list.postings {
-                    let doc_len = self
-                        .lexical_index
-                        .doc_lengths
-                        .get(posting.doc_id as usize)
-                        .copied()
-                        .unwrap_or(0);
-                    let score = bm25_score(
-                        posting.tf,
-                        doc_len,
-                        self.lexical_index.avg_doc_len,
-                        self.lexical_index.doc_count,
-                        entry.doc_freq,
-                    );
-                    *doc_scores.entry(posting.doc_id).or_insert(0.0) += score;
-                }
-            }
-        }
-
-        // Sort by score and take top_k
-        let mut results: Vec<(DocId, f32)> = doc_scores.into_iter().collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        results.truncate(top_k);
-
-        // Fetch document metadata
+        let results = self.search_lexical_raw(query, top_k).await?;
         self.fetch_results(&results).await
     }
 
@@ -173,31 +136,8 @@ impl IndexReader {
         top_k: usize,
         n_probe: usize,
     ) -> StorageResult<Vec<SearchResult>> {
-        if self.vector_index.num_clusters == 0 {
-            return Ok(Vec::new());
-        }
-
-        // Find nearest clusters
-        let cluster_indices = self.vector_index.find_clusters(query, n_probe);
-
-        // Fetch and search clusters
-        let mut all_results: Vec<(DocId, f32)> = Vec::new();
-
-        for cluster_idx in cluster_indices {
-            if cluster_idx < self.vector_index.cluster_ptrs.len() {
-                let ptr = &self.vector_index.cluster_ptrs[cluster_idx];
-                let cluster_data = self.fetch_cluster_data(ptr).await?;
-                let results = cluster_data.search(query, top_k);
-                all_results.extend(results);
-            }
-        }
-
-        // Sort by score (higher is better) and take top_k
-        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        all_results.truncate(top_k);
-
-        // Fetch document metadata
-        self.fetch_results(&all_results).await
+        let results = self.search_vector_raw(query, top_k, n_probe).await?;
+        self.fetch_results(&results).await
     }
 
     /// Perform hybrid (lexical + vector) search with RRF fusion.
@@ -233,6 +173,10 @@ impl IndexReader {
         query: &str,
         top_k: usize,
     ) -> StorageResult<Vec<(DocId, f32)>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+
         let tokens = tokenize(query);
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -264,8 +208,7 @@ impl IndexReader {
         }
 
         let mut results: Vec<(DocId, f32)> = doc_scores.into_iter().collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        results.truncate(top_k);
+        top_k_descending(&mut results, top_k);
 
         Ok(results)
     }
@@ -277,7 +220,7 @@ impl IndexReader {
         top_k: usize,
         n_probe: usize,
     ) -> StorageResult<Vec<(DocId, f32)>> {
-        if self.vector_index.num_clusters == 0 {
+        if self.vector_index.num_clusters == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
 
@@ -293,8 +236,7 @@ impl IndexReader {
             }
         }
 
-        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        all_results.truncate(top_k);
+        top_k_descending(&mut all_results, top_k);
 
         Ok(all_results)
     }
@@ -318,6 +260,24 @@ impl IndexReader {
 
         Ok(search_results)
     }
+}
+
+/// Retain the top_k entries by score (descending) using partial sorting.
+fn top_k_descending(results: &mut Vec<(DocId, f32)>, top_k: usize) {
+    if results.is_empty() || top_k == 0 {
+        results.clear();
+        return;
+    }
+
+    if results.len() > top_k {
+        let pivot = top_k.saturating_sub(1);
+        results.select_nth_unstable_by(pivot, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(top_k);
+    }
+
+    results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 }
 
 // Deserialization helpers using rkyv 0.8 API
