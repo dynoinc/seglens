@@ -1,12 +1,23 @@
+# yaml-language-server: $schema=https://json.schemastore.org/dependabot-2.0.json
+
 version: 2
 updates:
-  - package-ecosystem: cargo
+  - package-ecosystem: "cargo"
     directory: "/"
-    open-pull-requests-limit: 0
     schedule:
-      interval: "daily"
-  - package-ecosystem: github-actions
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
     directory: "/"
-    open-pull-requests-limit: 0
     schedule:
-      interval: "daily"
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    groups:
+      github-actions:
+        patterns:
+          - "*"
