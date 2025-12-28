@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// Target segment size (64 MB).
 const SEGMENT_SIZE: usize = 64 * 1024 * 1024;
@@ -821,7 +820,6 @@ impl IndexBuilder {
         stream::iter(segments.into_iter())
             .map(|(seg_id, data)| {
                 let path = format!("{}/segments/{:04}.dat", prefix, seg_id);
-                let store = store;
                 let pb = write_pb.clone();
                 async move {
                     store.put(&path, Bytes::from(data)).await?;

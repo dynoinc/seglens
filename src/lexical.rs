@@ -405,6 +405,7 @@ impl StreamingLexicalBuilder {
         for idx in 0..self.batch_count as usize {
             tasks_tx.send(idx).ok();
         }
+        drop(tasks_tx); // Signal no more tasks - prevents worker deadlock
 
         let mut handles = Vec::new();
         // Worker pool size: min(num_batches, 8)
