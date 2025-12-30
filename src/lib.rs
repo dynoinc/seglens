@@ -75,6 +75,8 @@ pub mod error;
 pub mod hybrid;
 pub mod lexical;
 pub mod object_store;
+#[cfg(feature = "python")]
+pub mod python;
 pub mod reader;
 pub mod storage;
 pub mod types;
