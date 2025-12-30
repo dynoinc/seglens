@@ -197,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 thread_local! {
-    static INDEX_BUILDER: RefCell<Option<IndexBuilder>> = RefCell::new(None);
+    static INDEX_BUILDER: RefCell<Option<IndexBuilder>> = const { RefCell::new(None) };
 }
 
 async fn download_and_feed(

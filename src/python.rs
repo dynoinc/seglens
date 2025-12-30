@@ -92,7 +92,7 @@ impl PyIndex {
 }
 
 #[pymodule]
-pub fn seglens(_py: Python, m: &PyModule) -> PyResult<()> {
+pub fn seglens(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIndex>()?;
     m.add_class::<PySearchResult>()?;
     Ok(())
