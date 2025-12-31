@@ -5,12 +5,16 @@ edition = "2021"
 description = "A Rust library for building and querying hybrid (semantic + lexical) search indexes optimized for object storage"
 license = "MIT"
 
+[lib]
+name = "seglens"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 object_store = "0.11"
 rkyv = { version = "0.8", features = ["bytecheck"] }
 bytes = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 async-trait = "0.1"
 memmap2 = "0.9"
 rand = "0.8"
@@ -18,10 +22,14 @@ indicatif = "0.17"
 tikv-jemallocator = { version = "0.5", optional = true }
 rayon = "1.8"
 crossbeam-channel = "0.5"
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+arrow-array = "54"
+pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
+python = ["pyo3"]
 
 [dependencies.futures]
 version = "0.3"
@@ -30,10 +38,7 @@ version = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
-parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
-arrow-array = "54"
-hf-hub = { version = "0.4", features = ["tokio"] }
 
-[[example]]
-name = "wikipedia"
-path = "examples/wikipedia.rs"
+[[bin]]
+name = "build-parquet-index"
+path = "src/bin/build_parquet_index.rs"
