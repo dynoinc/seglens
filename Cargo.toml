@@ -24,7 +24,7 @@ rayon = "1.8"
 crossbeam-channel = "0.5"
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 arrow-array = "54"
-pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
 
 [features]
 default = ["jemalloc"]
